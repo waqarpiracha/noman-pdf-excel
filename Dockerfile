@@ -16,4 +16,4 @@ COPY server.py extract.py format_excel.py ocr_dispatch.py ./
 RUN mkdir -p uploads output
 
 EXPOSE 10000
-CMD ["gunicorn", "server:app", "--bind", "0.0.0.0:10000", "--timeout", "300", "--workers", "2"]
+CMD ["sh", "-c", "gunicorn server:app --bind 0.0.0.0:${PORT:-10000} --timeout 300 --workers 2"]
