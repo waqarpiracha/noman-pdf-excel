@@ -1,0 +1,8 @@
+services:
+  - type: web
+    name: noman-pdf-excel
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    healthCheckPath: /
+    envVars: []
