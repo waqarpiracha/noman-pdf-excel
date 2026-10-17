@@ -146,34 +146,71 @@ dz.addEventListener('drop', e => {
   else status('Please drop PDF or photo files.');
 });
 
+// Shrink huge phone photos before upload: faster on slow networks,
+// faster to OCR, and the reader needs no more than ~2200px.
+async function shrinkImage(file, maxDim) {
+  maxDim = maxDim || 2200;
+  if (!file.type || file.type.indexOf('image/') !== 0) return file;
+  try {
+    const bmp = await createImageBitmap(file, {imageOrientation: 'from-image'});
+    const w = bmp.width, h = bmp.height;
+    if (Math.max(w, h) <= maxDim) { if (bmp.close) bmp.close(); return file; }
+    const s = maxDim / Math.max(w, h);
+    const c = document.createElement('canvas');
+    c.width = Math.round(w * s); c.height = Math.round(h * s);
+    c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height);
+    if (bmp.close) bmp.close();
+    const blob = await new Promise(res => c.toBlob(res, 'image/jpeg', 0.85));
+    if (!blob) return file;
+    const name = file.name.replace(/\.(png|heic|heif|webp|bmp)$/i, '.jpg');
+    return new File([blob], name, {type: 'image/jpeg'});
+  } catch (e) { return file; } // never break the upload
+}
+
 async function uploadFiles(picked) {
   const files = picked.filter(f => OK_EXT.test(f.name));
   if (!files.length) { status('Please choose PDF or photo files.'); return; }
+  const shrunk = [];
+  for (const f of files) shrunk.push(await shrinkImage(f));
   const fd = new FormData();
-  files.forEach(f => fd.append('files', f, f.name));
+  shrunk.forEach(f => fd.append('files', f, f.name));
   const bar = $('progress'), fill = $('progressbar');
   bar.style.display = 'block'; fill.style.width = '0%';
-  status(`Uploading ${files.length} file(s)…`);
+  status(`Uploading ${shrunk.length} file(s)… 0%`);
   try {
     await new Promise((res, rej) => {
       const x = new XMLHttpRequest();
       x.open('POST', '/upload');
-      x.upload.onprogress = ev => { if (ev.lengthComputable) fill.style.width = (ev.loaded/ev.total*100)+'%'; };
+      x.timeout = 120000; // 2 min: slow networks should fail loudly, not silently
+      x.upload.onprogress = ev => {
+        if (ev.lengthComputable) {
+          const pc = Math.round(ev.loaded/ev.total*100);
+          fill.style.width = pc+'%';
+          status(`Uploading ${shrunk.length} file(s)… ${pc}%`);
+        }
+      };
       x.onload = () => x.status === 200 ? res() : rej(new Error('HTTP '+x.status));
-      x.onerror = rej;
+      x.onerror = () => rej(new Error('network'));
+      x.ontimeout = () => rej(new Error('timeout'));
       x.send(fd);
     });
-    status(`✅ ${files.length} uploaded.`);
+    status(`✅ ${shrunk.length} uploaded.`);
     refresh();
-  } catch(err){ status('❌ Upload failed — check connection and retry.'); }
+  } catch(err){
+    status('❌ ' + (err.message === 'timeout'
+      ? 'Upload taking too long — check connection and retry.'
+      : 'Upload failed — check connection and retry.'));
+  }
   finally { setTimeout(()=>{ bar.style.display='none'; }, 800); }
 }
 
 $('make').addEventListener('click', async () => {
   const btn = $('make'); btn.disabled = true;
-  status2(''); $('make').innerHTML = '<span class="spinner"></span>Working…';
+  status2(''); $('make').innerHTML = '<span class="spinner"></span>Working… (photos can take a minute)';
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 300000); // 5 min max
   try {
-    const r = await fetch('/process', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'});
+    const r = await fetch('/process', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}', signal: ctrl.signal});
     const j = await r.json();
     if (!j.ok) { status2('❌ ' + (j.error || 'Processing failed.')); }
     else {
@@ -183,8 +220,12 @@ $('make').addEventListener('click', async () => {
       status2(msg);
       showDownload(j);
     }
-  } catch(e){ status2('❌ Could not reach server. Try again.'); }
-  finally { btn.disabled = false; btn.textContent = '⚙️ Make my Excel'; refresh(); }
+  } catch(e){
+    status2('❌ ' + (e && e.name === 'AbortError'
+      ? 'Taking too long — try fewer files at once.'
+      : 'Could not reach server. Try again.'));
+  }
+  finally { clearTimeout(timer); btn.disabled = false; btn.textContent = '⚙️ Make my Excel'; refresh(); }
 });
 
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(()=>{});
