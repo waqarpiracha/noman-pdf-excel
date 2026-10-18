@@ -45,7 +45,16 @@
   #filelist { list-style: none; margin: 12px 0 0; padding: 0; }
   #filelist li { padding: 10px 4px; border-bottom: 1px solid #eef1f4; font-size: 15px;
                  display: flex; justify-content: space-between; gap: 8px; }
+  #filelist li span.fname { flex: 1; overflow: hidden; text-overflow: ellipsis; }
   #filelist li span:last-child { color: #6b7a8a; white-space: nowrap; }
+  .rmbtn { border: none; background: #fdecea; color: #b3261e; border-radius: 8px;
+           font-size: 15px; font-weight: 700; padding: 4px 10px; cursor: pointer; }
+  .rmbtn:active { transform: scale(.95); }
+  .refreshbtn { border: 1px solid #1F4E79; background: #eaf1f8; color: #1F4E79;
+                border-radius: 8px; font-size: 14px; font-weight: 700;
+                padding: 6px 12px; cursor: pointer; float: right; }
+  .refreshbtn:active { transform: scale(.96); }
+  .card h2 .refreshbtn { margin-top: -4px; }
   #status { font-size: 14px; color: #33414f; min-height: 20px; margin-top: 8px; }
   #download { display: none; text-align: center; }
   #download a { display: inline-block; margin-top: 10px; padding: 16px 28px; font-size: 18px;
@@ -75,8 +84,10 @@
   </div>
 
   <div class="card">
-    <h2>2 · Today's files <span id="count" class="note"></span></h2>
+    <h2>2 · Today's files <span id="count" class="note"></span>
+      <button class="refreshbtn" id="refreshbtn">↻ Refresh</button></h2>
     <ul id="filelist"><li class="note">Nothing uploaded yet today.</li></ul>
+    <div class="note" id="srvmsg" style="margin-top:6px"></div>
   </div>
 
   <div class="card">
@@ -98,22 +109,47 @@ const status2 = t => { $('status2').textContent = t; };
 
 function fmtSize(b){ return b > 1048576 ? (b/1048576).toFixed(1)+' MB' : Math.round(b/1024)+' KB'; }
 
-async function refresh(){
+async function refresh(showMsg){
+  const msg = t => { $('srvmsg').textContent = t || ''; };
+  if (showMsg) msg('Checking server…');
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 25000); // cold start can take ~50s; fail fast with guidance
   try {
-    const r = await fetch('/status'); const s = await r.json();
+    const r = await fetch('/status', {signal: ctrl.signal}); const s = await r.json();
+    clearTimeout(timer);
     $('count').textContent = s.uploads ? `(${s.uploads})` : '';
     const f = await (await fetch('/files')).json();
     const ul = $('filelist'); ul.innerHTML = '';
     if (!f.files.length) ul.innerHTML = '<li class="note">Nothing uploaded yet today.</li>';
     f.files.forEach(n => {
       const li = document.createElement('li');
-      const a = document.createElement('span'); a.textContent = n;
+      const a = document.createElement('span'); a.textContent = n; a.className = 'fname';
       const b = document.createElement('span'); b.textContent = fmtSize(f.sizes[n]||0);
-      li.append(a,b); ul.appendChild(li);
+      const x = document.createElement('button'); x.textContent = '✕'; x.className = 'rmbtn'; x.title = 'Remove this file';
+      x.onclick = () => removeFile(n);
+      li.append(a,b,x); ul.appendChild(li);
     });
+    if (showMsg) msg(s.ready ? '✅ Server awake — output ready below.' : `✅ Server awake — ${s.uploads || 0} file(s) today.`);
     if (s.ready) showDownload(null);
-  } catch(e){ /* offline - ignore */ }
+  } catch(e){
+    clearTimeout(timer);
+    if (showMsg) msg('😴 Server is waking up (it sleeps when idle) — wait about a minute, then tap ↻ Refresh again.');
+  }
 }
+
+async function removeFile(n){
+  if (!confirm('Remove "' + n + '"?')) return;
+  try {
+    const r = await fetch('/remove', {method:'POST',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify({file:n})});
+    const j = await r.json();
+    if (!j.ok) { status('❌ Could not remove the file.'); return; }
+    $('download').style.display = 'none';
+  } catch(e){ status('❌ Could not reach server.'); return; }
+  refresh();
+}
+
+$('refreshbtn').addEventListener('click', () => refresh(true));
 
 function showDownload(info){
   $('download').style.display = 'block';

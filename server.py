@@ -19,6 +19,7 @@ photos are skipped with a note.
 """
 
 import os
+import re
 import glob
 import json
 from datetime import date
@@ -92,6 +93,31 @@ def upload():
         saved.append(name)
     return jsonify({"ok": True, "saved": saved, "skipped": skipped,
                     "day": today_str()})
+
+
+@app.post("/remove")
+def remove():
+    """Delete one uploaded file for a day (remove what is not required)."""
+    data = request.get_json(silent=True) or {}
+    day = data.get("day", today_str())
+    raw_name = data.get("file", "")
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day or ""):
+        return jsonify({"ok": False, "error": "bad day"}), 400
+    name = os.path.basename(raw_name or "")
+    if not name or name != raw_name:
+        return jsonify({"ok": False, "error": "bad filename"}), 400
+    root = os.path.abspath(UPLOAD_ROOT)
+    path = os.path.abspath(os.path.join(root, day, name))
+    if os.path.commonpath([path, root]) != root:
+        return jsonify({"ok": False, "error": "bad path"}), 400
+    if os.path.isfile(path):
+        os.remove(path)
+        # a stale output from a previous run no longer matches the files
+        out = output_path(day)
+        if os.path.exists(out):
+            os.remove(out)
+        return jsonify({"ok": True, "removed": name, "day": day})
+    return jsonify({"ok": False, "error": "not found"}), 404
 
 
 @app.get("/files")

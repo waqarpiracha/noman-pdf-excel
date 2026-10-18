@@ -38,6 +38,7 @@ need to touch):
 import os
 import re
 from datetime import datetime
+from multiprocessing import Process, Queue
 
 import pdfplumber
 
@@ -548,24 +549,25 @@ def process_files(paths):
 
     statements: one dict per file for the "Statements" sheet.
     raw_docs: generic pulls for files no parser recognized (Raw sheet).
+
+    Each file is parsed in its own process with a hard timeout: one hung
+    PDF can never take down the batch (2026-10-18: a live /process hung
+    with no output at all).
     """
     all_rows, notes, statements = [], [], []
     aging_all, raw_docs = [], []
     for p in sorted(paths):
-        rows, n, meta, aging_rows = extract_pdf(p)
+        fname = os.path.basename(p)
+        rows, n, meta, aging_rows, raw_doc = _process_one_guarded(p)
         all_rows.extend(rows)
         aging_all.extend(aging_rows)
         notes.extend(n)
-        if not rows and not aging_rows:
-            # unrecognized (or unparseable) -> pull everything, with headings
-            g = extract_generic_pdf(p)
-            notes.extend(g["notes"])
-            if g["tables"] or g["texts"]:
-                raw_docs.append(g)
+        if raw_doc:
+            raw_docs.append(raw_doc)
         statements.append({
             "Company": meta.get("company", ""),
             "CustomerCode": meta.get("customer_code", ""),
-            "SourceFile": os.path.basename(p),
+            "SourceFile": fname,
             "Report": meta.get("report", "Account Statement"),
             "StmtStart": meta.get("stmt_start") or "",
             "StmtEnd": meta.get("stmt_end") or "",
@@ -579,6 +581,57 @@ def process_files(paths):
     cols, rows = normalize_rows(all_rows)
     aging_cols, aging_rows = normalize_aging(aging_all)
     return cols, rows, notes, statements, aging_cols, aging_rows, raw_docs
+
+
+# ------------------------------------------------------------------
+# Per-file guard: parse each PDF in a child process with a hard
+# timeout. A hung file is terminated, noted, and skipped — the rest
+# of the batch still completes.
+# ------------------------------------------------------------------
+PER_FILE_TIMEOUT = 120  # seconds; a healthy PDF parses in <10s
+
+
+def _process_one_worker(payload):
+    """Child-process target: full per-file pipeline -> Queue."""
+    path, q = payload
+    try:
+        rows, notes, meta, aging_rows = extract_pdf(path)
+        raw_doc = None
+        if not rows and not aging_rows:
+            g = extract_generic_pdf(path)
+            for note in g["notes"]:
+                if note not in notes:
+                    notes.append(note)
+            if g["tables"] or g["texts"]:
+                raw_doc = g
+        q.put(("ok", (rows, notes, meta, aging_rows, raw_doc)))
+    except Exception as e:  # noqa: BLE001 - a file must never kill the batch
+        q.put(("err", f"{os.path.basename(path)}: failed ({e})"))
+
+
+def _process_one_guarded(path):
+    """(rows, notes, meta, aging_rows, raw_doc) for one PDF, or a timeout
+    skip. Never raises, never hangs past PER_FILE_TIMEOUT."""
+    fname = os.path.basename(path)
+    q = Queue()
+    proc = Process(target=_process_one_worker, args=((path, q),))
+    proc.daemon = True
+    proc.start()
+    proc.join(timeout=PER_FILE_TIMEOUT)
+    if proc.is_alive():
+        proc.terminate()
+        proc.join()
+        return ([], [f"{fname}: took too long (>2 min), skipped — "
+                     "try it alone, or send it as photos"],
+                {"report": "Skipped (too slow)"}, [], None)
+    try:
+        status, payload = q.get_nowait()
+    except Exception:  # noqa: BLE001 - child died without answering
+        return ([], [f"{fname}: no result, skipped"],
+                {"report": "Failed"}, [], None)
+    if status == "err":
+        return ([], [payload], {"report": "Failed"}, [], None)
+    return payload
 
 
 if __name__ == "__main__":
