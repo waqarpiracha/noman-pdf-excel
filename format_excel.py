@@ -94,7 +94,7 @@ def _to_date(v):
 
 
 def build_workbook(columns, rows, title="Customer Account Statements",
-                   statements=None, dispatches=None, aging=None):
+                   statements=None, dispatches=None, aging=None, raw=None):
     wb = Workbook()
     ws = wb.active
     ws.title = "Transactions"
@@ -110,6 +110,10 @@ def build_workbook(columns, rows, title="Customer Account Statements",
             ws.cell(row=1, column=1,
                     value="No ledger statements in this batch — see the "
                           "Aging sheet for customer balances.")
+        elif raw:
+            ws.cell(row=1, column=1,
+                    value="No recognized statements in this batch — see the "
+                          "Raw sheet for everything pulled from the file(s).")
         else:
             ws.cell(row=1, column=1,
                     value="No PDF statements in this batch — see the "
@@ -121,6 +125,8 @@ def build_workbook(columns, rows, title="Customer Account Statements",
             _add_dispatches_sheet(wb, dispatches)
         if aging:
             _add_aging_sheet(wb, *aging)
+        if raw:
+            _add_raw_sheet(wb, raw)
         return wb
 
     # ---- title block ----
@@ -220,6 +226,10 @@ def build_workbook(columns, rows, title="Customer Account Statements",
     if aging:
         _add_aging_sheet(wb, *aging)
 
+    # ---- Raw sheet (unrecognized PDFs: everything pulled) ----
+    if raw:
+        _add_raw_sheet(wb, raw)
+
     return wb
 
 
@@ -272,9 +282,9 @@ def _add_statements_sheet(wb, statements):
 
 
 def write_excel(columns, rows, path, title="Customer Account Statements",
-                statements=None, dispatches=None, aging=None):
+                statements=None, dispatches=None, aging=None, raw=None):
     wb = build_workbook(columns, rows, title, statements=statements,
-                        dispatches=dispatches, aging=aging)
+                        dispatches=dispatches, aging=aging, raw=raw)
     wb.save(path)
     return path
 
@@ -345,6 +355,102 @@ def _add_aging_sheet(wb, acols, arows):
         if col in AGING_NUM_COLS:
             w = min(w, 16)
         ws.column_dimensions[get_column_letter(j)].width = w
+
+
+# ------------------------------------------------------------------
+# Raw sheet: unrecognized PDFs. Every table and every text line is
+# pulled with the document's own headings, each block labelled with
+# its page. The yellow banner says it plainly: format not recognized,
+# please verify. (Waqar, 2026-10-18: "pull everything".)
+# ------------------------------------------------------------------
+
+RAW_LABEL_FONT = Font(bold=True, size=11, color="1F4E79")
+
+
+def _add_raw_sheet(wb, raw_docs):
+    ws = wb.create_sheet("Raw")
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+
+    maxw = 2
+    for doc in raw_docs:
+        for (_, heads, _) in doc["tables"]:
+            maxw = max(maxw, len(heads))
+    ncols = maxw + 1  # col A = line no / blank, rest = content
+
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=ncols)
+    tc = ws.cell(row=1, column=1, value="Raw extract — format not recognized")
+    tc.font = TITLE_FONT
+    ntables = sum(len(d["tables"]) for d in raw_docs)
+    ntexts = sum(len(d["texts"]) for d in raw_docs)
+    ws.cell(row=2, column=1,
+            value=f"Generated {datetime.now():%d-%b-%Y %I:%M %p}  |  "
+                  f"{ntables} table(s), {ntexts} text line(s) from "
+                  f"{len(raw_docs)} file(s). Headings are the document's "
+                  f"own — please verify before using.")
+    ws.row_dimensions[1].height = 24
+
+    def banner(text):
+        ws.merge_cells(start_row=r[0], start_column=1,
+                       end_row=r[0], end_column=ncols)
+        c = ws.cell(row=r[0], column=1, value=text)
+        c.font = RAW_LABEL_FONT
+        c.fill = LOWCONF_FILL
+        for j in range(1, ncols + 1):
+            ws.cell(row=r[0], column=j).fill = LOWCONF_FILL
+            ws.cell(row=r[0], column=j).border = BORDER
+
+    r = [4]
+    for doc in raw_docs:
+        banner(f"\U0001F4C4 {doc['SourceFile']} — layout not recognized; "
+               f"everything pulled below, please verify.")
+        r[0] += 1
+        for (pageno, tno, heads, data) in doc["tables"]:
+            banner(f"Page {pageno} · Table {tno} ({len(heads)} columns)")
+            r[0] += 1
+            for j, h in enumerate(heads, start=2):
+                c = ws.cell(row=r[0], column=j, value=h)
+                c.font = HEADER_FONT
+                c.fill = HEADER_FILL
+                c.alignment = CENTER
+                c.border = BORDER
+            ws.cell(row=r[0], column=1, value="#").font = HEADER_FONT
+            ws.cell(row=r[0], column=1).fill = HEADER_FILL
+            ws.cell(row=r[0], column=1).alignment = CENTER
+            ws.cell(row=r[0], column=1).border = BORDER
+            r[0] += 1
+            for i, row in enumerate(data):
+                if i % 2 == 1:
+                    for j in range(1, ncols + 1):
+                        ws.cell(row=r[0], column=j).fill = ZEBRA
+                ws.cell(row=r[0], column=1, value=i + 1).border = BORDER
+                ws.cell(row=r[0], column=1).alignment = CENTER
+                for j, v in enumerate(row, start=2):
+                    c = ws.cell(row=r[0], column=j, value=v or None)
+                    c.border = BORDER
+                    c.alignment = WRAP
+                r[0] += 1
+        if doc["texts"]:
+            banner(f"Text lines ({len(doc['texts'])} total, no tables found)")
+            r[0] += 1
+            for (pageno, lno, ln) in doc["texts"]:
+                ws.merge_cells(start_row=r[0], start_column=2,
+                               end_row=r[0], end_column=ncols)
+                ws.cell(row=r[0], column=1, value=lno).border = BORDER
+                ws.cell(row=r[0], column=1).alignment = CENTER
+                c = ws.cell(row=r[0], column=2, value=f"[p{pageno}] {ln}")
+                c.border = BORDER
+                c.alignment = WRAP
+                r[0] += 1
+        r[0] += 1  # blank line between documents
+
+    ws.column_dimensions["A"].width = 8
+    for j in range(2, ncols + 1):
+        ws.column_dimensions[get_column_letter(j)].width = 30
+    ws.freeze_panes = "A5"
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+    ws.page_setup.orientation = "landscape"
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
 
 
 # ------------------------------------------------------------------

@@ -121,6 +121,7 @@ function showDownload(info){
   if (info) {
     let s = `${info.files_processed} PDF(s) → ${info.rows} ledger rows`;
     if (info.aging_rows) s += ` + ${info.aging_rows} aging rows`;
+    if (info.raw_files) s += ` + raw extract from ${info.raw_files} unrecognized file(s)`;
     s += `, ${info.columns.length} columns.`;
     if (info.photos_processed) s += ` ${info.photos_processed} photo(s) → ${info.shipments} shipment(s) on the Dispatches sheet.`;
     $('summary').textContent = s;
@@ -218,6 +219,7 @@ $('make').addEventListener('click', async () => {
     else {
       let msg = `✅ Done — ${j.rows} ledger rows`;
       if (j.aging_rows) msg += ` + ${j.aging_rows} aging rows`;
+      if (j.raw_files) msg += ` + ${j.raw_tables} table(s) pulled raw from ${j.raw_files} unrecognized file(s) — check the Raw sheet`;
       msg += ` from ${j.files_processed} PDF(s).`;
       if (j.photos_processed) msg += ` ${j.shipments} shipment(s) from ${j.photos_processed} photo(s).`;
       if (j.notes && j.notes.length) msg += ' Note: ' + j.notes.slice(0,2).join(' · ');

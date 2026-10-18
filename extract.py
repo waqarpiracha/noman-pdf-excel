@@ -362,6 +362,74 @@ def normalize_aging(all_rows):
                            for r in rows]
 
 
+# ------------------------------------------------------------------
+# 6. GENERIC FALLBACK (2026-10-18, Waqar): "if it does not recognize,
+#    pull everything with headings in a new sheet." Any PDF that yields
+#    zero ledger AND zero aging rows gets every table and every text
+#    line pulled into the "Raw" sheet instead of an empty workbook.
+# ------------------------------------------------------------------
+
+def _extract_generic_tables(page):
+    """Yield (headings, data_rows) for every table on the page."""
+    for table in page.extract_tables() or []:
+        rows = [[(c or "").strip() for c in r] for r in table]
+        rows = [r for r in rows if any(r)]
+        if not rows:
+            continue
+        heads, seen, fixed = rows[0], {}, []
+        for i, h in enumerate(heads):
+            h = h or f"Column {i + 1}"
+            if h in seen:
+                seen[h] += 1
+                h = f"{h} ({seen[h]})"
+            else:
+                seen[h] = 1
+            fixed.append(h)
+        width = len(fixed)
+        data = []
+        for r in rows[1:]:
+            r = (r + [""] * width)[:width]
+            if any(r):
+                data.append(r)
+        yield fixed, data
+
+
+def extract_generic_pdf(path):
+    """Last-resort pull for unrecognized PDFs.
+
+    Returns {"SourceFile", "tables": [(pageno, tableno, headings, rows)],
+             "texts": [(pageno, lineno, text)], "notes": [...]}.
+    Tables win over text on any page (no duplication).
+    """
+    fname = os.path.basename(path)
+    doc = {"SourceFile": fname, "tables": [], "texts": [], "notes": []}
+    try:
+        pdf = pdfplumber.open(path)
+    except Exception as e:
+        doc["notes"].append(f"{fname}: could not open ({e})")
+        return doc
+    with pdf:
+        for i, page in enumerate(pdf.pages, start=1):
+            tables = list(_extract_generic_tables(page))
+            if tables:
+                for tno, (heads, data) in enumerate(tables, start=1):
+                    if data:
+                        doc["tables"].append((i, tno, heads, data))
+                    else:
+                        doc["notes"].append(
+                            f"{fname} p{i} table {tno}: headings only, no data")
+                continue
+            text = (page.extract_text() or "").strip()
+            if text:
+                for lno, ln in enumerate(text.splitlines(), start=1):
+                    ln = ln.strip()
+                    if ln:
+                        doc["texts"].append((i, lno, ln))
+    if not doc["tables"] and not doc["texts"]:
+        doc["notes"].append(f"{fname}: no extractable content at all")
+    return doc
+
+
 def extract_pdf(path):
     """Extract normalized rows from one PDF.
 
@@ -475,18 +543,25 @@ def normalize_rows(all_rows):
 
 
 def process_files(paths):
-    """Full pipeline: list of PDF paths
-    -> (columns, rows, notes, statements, aging_columns, aging_rows).
+    """Full pipeline: list of PDF paths ->
+    (columns, rows, notes, statements, aging_columns, aging_rows, raw_docs).
 
     statements: one dict per file for the "Statements" sheet.
+    raw_docs: generic pulls for files no parser recognized (Raw sheet).
     """
     all_rows, notes, statements = [], [], []
-    aging_all = []
+    aging_all, raw_docs = [], []
     for p in sorted(paths):
         rows, n, meta, aging_rows = extract_pdf(p)
         all_rows.extend(rows)
         aging_all.extend(aging_rows)
         notes.extend(n)
+        if not rows and not aging_rows:
+            # unrecognized (or unparseable) -> pull everything, with headings
+            g = extract_generic_pdf(p)
+            notes.extend(g["notes"])
+            if g["tables"] or g["texts"]:
+                raw_docs.append(g)
         statements.append({
             "Company": meta.get("company", ""),
             "CustomerCode": meta.get("customer_code", ""),
@@ -503,14 +578,15 @@ def process_files(paths):
         })
     cols, rows = normalize_rows(all_rows)
     aging_cols, aging_rows = normalize_aging(aging_all)
-    return cols, rows, notes, statements, aging_cols, aging_rows
+    return cols, rows, notes, statements, aging_cols, aging_rows, raw_docs
 
 
 if __name__ == "__main__":
     import sys
-    cols, rows, notes, statements, aging_cols, aging_rows = process_files(
-        sys.argv[1:])
-    print(f"rows={len(rows)} cols={len(cols)} aging_rows={len(aging_rows)}")
+    cols, rows, notes, statements, aging_cols, aging_rows, raw_docs = (
+        process_files(sys.argv[1:]))
+    print(f"rows={len(rows)} cols={len(cols)} aging_rows={len(aging_rows)} "
+          f"raw_docs={len(raw_docs)}")
     for s in statements:
         print("statement:", {k: v for k, v in s.items()})
     for n in notes:

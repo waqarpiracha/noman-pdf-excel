@@ -117,8 +117,8 @@ def process():
         return jsonify({"ok": False,
                         "error": "no PDFs or photos uploaded for " + day}), 400
 
-    cols, rows, notes, statements, aging_cols, aging_rows = (
-        process_files(pdfs) if pdfs else ([], [], [], [], [], []))
+    cols, rows, notes, statements, aging_cols, aging_rows, raw_docs = (
+        process_files(pdfs) if pdfs else ([], [], [], [], [], [], []))
 
     dispatches, ocr_notes = [], []
     if photos:
@@ -137,9 +137,12 @@ def process():
         title = f"Customer Balances (Aging) — {day}"
     elif aging_rows and rows:
         title = f"Customer Statements + Aging — {day}"
+    elif raw_docs and not rows and not aging_rows:
+        title = f"Raw Extract — {day}"
     write_excel(cols, rows, out, title=title,
                 statements=statements, dispatches=dispatches,
-                aging=(aging_cols, aging_rows) if aging_rows else None)
+                aging=(aging_cols, aging_rows) if aging_rows else None,
+                raw=raw_docs or None)
     return jsonify({
         "ok": True, "day": day,
         "files_processed": len(pdfs),
@@ -147,6 +150,8 @@ def process():
         "shipments": len(dispatches),
         "rows": len(rows),
         "aging_rows": len(aging_rows),
+        "raw_files": len(raw_docs),
+        "raw_tables": sum(len(d["tables"]) for d in raw_docs),
         "columns": [c for c in cols if not c.startswith("_")],
         "notes": notes + ocr_notes,
         "download": "/download?day=" + day,
