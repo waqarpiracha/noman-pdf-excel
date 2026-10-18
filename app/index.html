@@ -119,7 +119,9 @@ function showDownload(info){
   $('download').style.display = 'block';
   $('dllink').href = '/download';
   if (info) {
-    let s = `${info.files_processed} PDF(s) → ${info.rows} rows, ${info.columns.length} columns.`;
+    let s = `${info.files_processed} PDF(s) → ${info.rows} ledger rows`;
+    if (info.aging_rows) s += ` + ${info.aging_rows} aging rows`;
+    s += `, ${info.columns.length} columns.`;
     if (info.photos_processed) s += ` ${info.photos_processed} photo(s) → ${info.shipments} shipment(s) on the Dispatches sheet.`;
     $('summary').textContent = s;
   }
@@ -214,7 +216,9 @@ $('make').addEventListener('click', async () => {
     const j = await r.json();
     if (!j.ok) { status2('❌ ' + (j.error || 'Processing failed.')); }
     else {
-      let msg = `✅ Done — ${j.rows} rows from ${j.files_processed} PDF(s).`;
+      let msg = `✅ Done — ${j.rows} ledger rows`;
+      if (j.aging_rows) msg += ` + ${j.aging_rows} aging rows`;
+      msg += ` from ${j.files_processed} PDF(s).`;
       if (j.photos_processed) msg += ` ${j.shipments} shipment(s) from ${j.photos_processed} photo(s).`;
       if (j.notes && j.notes.length) msg += ' Note: ' + j.notes.slice(0,2).join(' · ');
       status2(msg);

@@ -27,7 +27,8 @@ WRAP = Alignment(vertical="center", wrap_text=True)
 CENTER = Alignment(vertical="center", wrap_text=True, horizontal="center")
 
 NUMERIC_HINTS = {"qty", "rate", "amount", "disc", "net", "s.no", "sno", "no",
-                 "size", "length", "salestax", "tax", "debit", "credit", "balance"}
+                 "size", "length", "salestax", "tax", "debit", "credit", "balance",
+                 "received", "days"}
 DATE_HINTS = {"date"}
 
 
@@ -93,7 +94,7 @@ def _to_date(v):
 
 
 def build_workbook(columns, rows, title="Customer Account Statements",
-                   statements=None, dispatches=None):
+                   statements=None, dispatches=None, aging=None):
     wb = Workbook()
     ws = wb.active
     ws.title = "Transactions"
@@ -104,15 +105,22 @@ def build_workbook(columns, rows, title="Customer Account Statements",
     meta_cols = [c for c in columns if c.startswith("_")]
 
     if not vis_cols:
-        # photo-only batch: no PDF transactions, keep a placeholder sheet
-        ws.cell(row=1, column=1,
-                value="No PDF statements in this batch — see the "
-                      "Dispatches sheet for photo OCR results.")
+        # no ledger transactions: keep a placeholder sheet
+        if aging:
+            ws.cell(row=1, column=1,
+                    value="No ledger statements in this batch — see the "
+                          "Aging sheet for customer balances.")
+        else:
+            ws.cell(row=1, column=1,
+                    value="No PDF statements in this batch — see the "
+                          "Dispatches sheet for photo OCR results.")
         ws.column_dimensions["A"].width = 70
         if statements:
             _add_statements_sheet(wb, statements)
         if dispatches:
             _add_dispatches_sheet(wb, dispatches)
+        if aging:
+            _add_aging_sheet(wb, *aging)
         return wb
 
     # ---- title block ----
@@ -208,11 +216,16 @@ def build_workbook(columns, rows, title="Customer Account Statements",
     if dispatches:
         _add_dispatches_sheet(wb, dispatches)
 
+    # ---- Aging sheet (Customer's Balances report) ----
+    if aging:
+        _add_aging_sheet(wb, *aging)
+
     return wb
 
 
 STATEMENT_COLUMNS = [
     ("Company", "text"), ("CustomerCode", "text"), ("SourceFile", "text"),
+    ("Report", "text"),
     ("StmtStart", "date"), ("StmtEnd", "date"), ("SalesPerson", "text"),
     ("PreviousBalance", "number"), ("NTN", "text"), ("STRN", "text"),
     ("Rows", "int"),
@@ -259,11 +272,79 @@ def _add_statements_sheet(wb, statements):
 
 
 def write_excel(columns, rows, path, title="Customer Account Statements",
-                statements=None, dispatches=None):
+                statements=None, dispatches=None, aging=None):
     wb = build_workbook(columns, rows, title, statements=statements,
-                        dispatches=dispatches)
+                        dispatches=dispatches, aging=aging)
     wb.save(path)
     return path
+
+
+# ------------------------------------------------------------------
+# Aging sheet ("Customer's Balances" report). One row per invoice
+# (InvoiceNo blank = customer-level balance line, no open invoice).
+# ------------------------------------------------------------------
+
+AGING_DATE_COLS = {"InvoiceDate"}
+AGING_NUM_COLS = {"Amount", "Received", "InvoiceBalance", "Balance", "Days"}
+
+
+def _add_aging_sheet(wb, acols, arows):
+    ws = wb.create_sheet("Aging")
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+    n = len(acols)
+
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=n)
+    tc = ws.cell(row=1, column=1, value="Customer Balances — aging")
+    tc.font = TITLE_FONT
+    ws.cell(row=2, column=1,
+            value=f"Generated {datetime.now():%d-%b-%Y %I:%M %p}  |  "
+                  f"{len(arows)} invoice/balance rows")
+    ws.row_dimensions[1].height = 24
+
+    hdr_row = 4
+    for j, col in enumerate(acols, start=1):
+        c = ws.cell(row=hdr_row, column=j, value=col)
+        c.font = HEADER_FONT
+        c.fill = HEADER_FILL
+        c.alignment = CENTER
+        c.border = BORDER
+    ws.row_dimensions[hdr_row].height = 20
+
+    for i, r in enumerate(arows):
+        rr = hdr_row + 1 + i
+        if i % 2 == 1:
+            for j in range(1, n + 1):
+                ws.cell(row=rr, column=j).fill = ZEBRA
+        for j, col in enumerate(acols, start=1):
+            v = r.get(col, "")
+            if col in AGING_DATE_COLS and v:
+                v = _to_date(v)
+            elif col in AGING_NUM_COLS and str(v).strip() not in ("", "-"):
+                v = _to_number(v)
+            c = ws.cell(row=rr, column=j, value=v if v != "" else None)
+            c.border = BORDER
+            c.alignment = (CENTER if col in AGING_DATE_COLS | AGING_NUM_COLS
+                           else WRAP)
+            if col in AGING_DATE_COLS:
+                c.number_format = "DD-MMM-YYYY"
+            elif col in AGING_NUM_COLS:
+                c.number_format = "#,##0.00" if col != "Days" else "#,##0"
+
+    last_row = hdr_row + len(arows)
+    last_col = get_column_letter(n)
+    if arows:
+        ws.auto_filter.ref = f"A{hdr_row}:{last_col}{last_row}"
+    ws.freeze_panes = f"A{hdr_row + 1}"
+    ws.print_title_rows = f"{hdr_row}:{hdr_row}"
+    ws.page_setup.orientation = "landscape"
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
+    for j, col in enumerate(acols, start=1):
+        vals = [str(col)] + [str(r.get(col, "")) for r in arows]
+        w = min(max(max(len(v) for v in vals) + 4, 12), 42)
+        if col in AGING_NUM_COLS:
+            w = min(w, 16)
+        ws.column_dimensions[get_column_letter(j)].width = w
 
 
 # ------------------------------------------------------------------

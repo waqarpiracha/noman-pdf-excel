@@ -117,8 +117,8 @@ def process():
         return jsonify({"ok": False,
                         "error": "no PDFs or photos uploaded for " + day}), 400
 
-    cols, rows, notes, statements = process_files(pdfs) if pdfs else (
-        [], [], [], [])
+    cols, rows, notes, statements, aging_cols, aging_rows = (
+        process_files(pdfs) if pdfs else ([], [], [], [], [], []))
 
     dispatches, ocr_notes = [], []
     if photos:
@@ -132,15 +132,21 @@ def process():
             ocr_notes = [f"photo OCR failed: {e}"]
 
     out = output_path(day)
-    write_excel(cols, rows, out,
-                title=f"Customer Account Statements — {day}",
-                statements=statements, dispatches=dispatches)
+    title = f"Customer Account Statements — {day}"
+    if aging_rows and not rows:
+        title = f"Customer Balances (Aging) — {day}"
+    elif aging_rows and rows:
+        title = f"Customer Statements + Aging — {day}"
+    write_excel(cols, rows, out, title=title,
+                statements=statements, dispatches=dispatches,
+                aging=(aging_cols, aging_rows) if aging_rows else None)
     return jsonify({
         "ok": True, "day": day,
         "files_processed": len(pdfs),
         "photos_processed": len(photos),
         "shipments": len(dispatches),
         "rows": len(rows),
+        "aging_rows": len(aging_rows),
         "columns": [c for c in cols if not c.startswith("_")],
         "notes": notes + ocr_notes,
         "download": "/download?day=" + day,

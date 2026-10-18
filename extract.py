@@ -30,6 +30,8 @@ need to touch):
   2. COLUMN_MAP     - extra header spellings -> canonical name.
   3. CANONICAL_COLUMNS - final Excel column order (visible).
   4. HEADER_PATTERNS - regexes for the page-1 statement header block.
+  5. AGING_*        - the "Customer's Balances" aging report (2026-10-18):
+                     a second document type with its own parser + sheet.
 ====================================================================
 """
 
@@ -156,7 +158,8 @@ def _parse_statement_header(page1_text):
     """Extract the statement header block from page-1 text."""
     meta = {"company": "", "customer_code": "", "stmt_start": None,
             "stmt_end": None, "ntn": "", "strn": "",
-            "sales_person": "", "previous_balance": None}
+            "sales_person": "", "previous_balance": None,
+            "report": "Account Statement"}
     if not page1_text or LEDGER_MARKER not in page1_text:
         return meta
     lines = [ln.strip() for ln in page1_text.splitlines()]
@@ -201,20 +204,203 @@ def _extract_ledger_tables(page):
         yield rows[1:]
 
 
-def extract_pdf(path):
-    """Extract normalized ledger rows from one PDF. Returns (rows, notes, meta)."""
+# ------------------------------------------------------------------
+# 5. AGING REPORT: "Customer's Balances" (Crystal Reports).
+#    Added 2026-10-18: Noman's real aging PDF produced 0 ledger rows
+#    because it is a different document type, not a broken file.
+#
+#    Text layout (NOT a table):
+#      Customer line: 1010023  BIN HASHIM ... LTD<2+sp>ISLAMABAD<2+sp>0
+#      Invoice line:  STINV-489  02-Aug-2026  3,070,961  2,622,440
+#                     448,521  448,521  76
+#      Summary line:  19-Oct-2026  -2,013  0  -2,013  -2,013  -2
+#                     (customer balance, no invoice number -> kept)
+#    Subtotal lines (bare amounts, no date/invoice) and the Grand Total
+#    line carry no new information -> skipped, never guessed.
+# ------------------------------------------------------------------
+AGING_MARKER = "Customer's Balances"
+
+AGING_COLUMNS = ["CustomerCode", "CustomerName", "City", "InvoiceNo",
+                 "InvoiceDate", "Amount", "Received", "InvoiceBalance",
+                 "Balance", "Days", "SourceFile"]
+
+_MONEY = r"-?[\d,]+(?:\.\d+)?"
+_RE_AGING_CUST = re.compile(rf"^(\d{{7}})\s+(.*?)\s+({_MONEY})\s*$")
+_RE_AGING_INV = re.compile(
+    rf"^\s*([A-Z]{{2,10}}-\d+)\s+(\d{{2}}-[A-Za-z]{{3}}-\d{{4}})\s+"
+    rf"({_MONEY})\s+({_MONEY})\s+({_MONEY})\s+({_MONEY})\s+(-?\d+)\s*$")
+_RE_AGING_SUM = re.compile(
+    rf"^\s*(\d{{2}}-[A-Za-z]{{3}}-\d{{4}})\s+"
+    rf"({_MONEY})\s+({_MONEY})\s+({_MONEY})\s+({_MONEY})\s+(-?\d+)\s*$")
+_RE_AGING_SKIP = re.compile(
+    r"Customer's Balances|To Date|CustomerCode|CustomerName|"
+    r"invoice No\.|Page \d+ of \d+|Grand Total")
+
+
+# Pakistani cities, used to split "NAME ... CITY" customer lines.
+# pdfplumber collapses the name/city column gap to single spaces, so the
+# city is found by lookup (1-3 trailing tokens). A trailing token that is
+# not a known city is NEVER guessed -> city stays blank.
+_PAK_CITIES = frozenset([
+    "ISLAMABAD", "KARACHI", "LAHORE", "MULTAN", "FAISALABAD", "RAWALPINDI",
+    "GUJRAT", "RAIWIND", "PESHAWAR", "QUETTA", "HYDERABAD", "SIALKOT",
+    "GUJRANWALA", "BAHAWALPUR", "SARGODHA", "SUKKUR", "LARKANA",
+    "SHEIKHUPURA", "JHELUM", "SAHIWAL", "OKARA", "KASUR", "MARDAN",
+    "ABBOTTABAD", "MANSEHRA", "NOWSHERA", "ATTOCK", "CHAKWAL", "TAXILA",
+    "KHAIRPUR", "SHIKARPUR", "JACOBABAD", "NAWABSHAH", "DADU", "BADIN",
+    "THATTA", "UMERKOT", "MIRPURKHAS", "TANDO ADAM", "MUZAFFARABAD",
+    "GILGIT", "SKARDU", "TURBAT", "GAWADAR", "KHUZDAR", "CHITRAL", "SWAT",
+    "MINGORA", "KOHAT", "BANNU", "KAMALIA", "CHISHTIAN", "VEHARI",
+    "KHANEWAL", "LODHRAN", "PAKPATTAN", "ARIFWALA", "JARANWALA", "HAFIZABAD",
+    "NAROWAL", "PASRUR", "WAZIRABAD", "MANDI BAHAUDDIN", "PHALIA", "BHALWAL",
+    "KOT MOMIN", "CHINIOT", "JHANG", "SHORKOT", "GOJRA", "SAMUNDRI",
+    "DUNYAPUR", "MAILSI", "BUREWALA", "CHICHAWATNI", "SHUJABAD", "JALALPUR",
+    "PIR MAHAL", "TOBA TEK SINGH",
+    # multi-word towns (checked as trailing 2-3 tokens)
+    "DERA ISMAIL KHAN", "DERA GHAZI KHAN", "RAHIM YAR KHAN", "WAH CANTT",
+    "KOT ADDU", "KOT ABDUL MALIK",
+])
+
+
+def _split_aging_customer(middle):
+    """'NAME ... CITY' (balance already stripped) -> (name, city).
+
+    The city is the trailing 1-3 tokens when they form a known Pakistani
+    city; otherwise the whole text is the name and city stays blank.
+    """
+    toks = middle.strip().split()
+    for n in (3, 2, 1):
+        if len(toks) > n:
+            cand = " ".join(toks[-n:])
+            if cand in _PAK_CITIES:
+                return " ".join(toks[:-n]), cand
+    return " ".join(toks), ""
+
+
+def _parse_date_mmm(s):
+    """'02-Aug-2026' -> date(2026,8,2). None if bad."""
+    s = str(s or "").strip()
+    try:
+        return datetime.strptime(s, "%d-%b-%Y").date()
+    except ValueError:
+        return None
+
+
+def _aging_row(ctx, fname, inv_no, dt_raw, amt, rec, ibal, bal, days,
+               pageno, notes):
+    d = _parse_date_mmm(dt_raw)
+    if d is None:
+        notes.append(f"{fname} p{pageno}: bad date {dt_raw!r} (kept as text)")
+    def money(v):
+        m = _parse_money(v)
+        return m if m is not None else ""
+    row = {
+        "CustomerCode": ctx.get("code", ""),
+        "CustomerName": ctx.get("name", ""),
+        "City": ctx.get("city", ""),
+        "InvoiceNo": inv_no,
+        "InvoiceDate": d if d else (dt_raw or ""),
+        "Amount": money(amt),
+        "Received": money(rec),
+        "InvoiceBalance": money(ibal),
+        "Balance": money(bal),
+        "Days": int(days),
+        "SourceFile": fname,
+    }
+    return row
+
+
+def _extract_aging_page(text, fname, pageno, ctx):
+    """Parse one page of a Customer's Balances report.
+
+    ctx carries the current customer across lines (and pages).
+    Returns (rows, notes)."""
     rows, notes = [], []
+    for raw in (text or "").splitlines():
+        ln = raw.rstrip()
+        if not ln.strip() or _RE_AGING_SKIP.search(ln):
+            continue
+        m = _RE_AGING_CUST.match(ln)
+        if m:
+            name, city = _split_aging_customer(m.group(2))
+            ctx.update(code=m.group(1), name=name, city=city)
+            continue
+        m = _RE_AGING_INV.match(ln)
+        if m:
+            rows.append(_aging_row(
+                ctx, fname, m.group(1), m.group(2), m.group(3), m.group(4),
+                m.group(5), m.group(6), m.group(7), pageno, notes))
+            continue
+        m = _RE_AGING_SUM.match(ln)
+        if m:
+            # customer-level balance line (no invoice number) -> kept
+            rows.append(_aging_row(
+                ctx, fname, "", m.group(1), m.group(2), m.group(3),
+                m.group(4), m.group(5), m.group(6), pageno, notes))
+            continue
+        # subtotal lines and anything unrecognized: skipped, never guessed
+    return rows, notes
+
+
+def _dedupe_aging(rows):
+    """Drop exact-duplicate aging rows (same customer+invoice+amount+file)."""
+    seen, out = set(), []
+    for r in rows:
+        key = (r.get("CustomerCode"), r.get("InvoiceNo"),
+               str(r.get("InvoiceDate")), str(r.get("Amount")),
+               r.get("SourceFile"))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(r)
+    return out
+
+
+def normalize_aging(all_rows):
+    rows = _dedupe_aging(all_rows)
+    return AGING_COLUMNS, [{c: r.get(c, "") for c in AGING_COLUMNS}
+                           for r in rows]
+
+
+def extract_pdf(path):
+    """Extract normalized rows from one PDF.
+
+    Returns (rows, notes, meta, aging_rows): ledger rows go to the
+    Transactions sheet, aging-report rows to the Aging sheet.
+    """
+    rows, notes, aging_rows = [], [], []
     fname = os.path.basename(path)
     try:
         pdf = pdfplumber.open(path)
     except Exception as e:
-        return [], [f"{fname}: could not open ({e})"], {}
+        return [], [f"{fname}: could not open ({e})"], {}, []
 
     meta = {}
     with pdf:
         pages = list(pdf.pages)
-        if pages:
-            meta = _parse_statement_header(pages[0].extract_text() or "")
+        page1_text = pages[0].extract_text() or "" if pages else ""
+        if AGING_MARKER in page1_text:
+            # ---- second document type: Customer's Balances aging ----
+            m = re.search(r"To Date\s*:\s*([0-9]{1,2}-[A-Za-z]{3}-[0-9]{4})",
+                          page1_text)
+            to_date = ""
+            if m:
+                try:
+                    to_date = datetime.strptime(m.group(1), "%d-%b-%Y").date()
+                except ValueError:
+                    pass
+            meta = {"report": "Customer's Balances", "to_date": to_date}
+            ctx = {}
+            for i, page in enumerate(pages, start=1):
+                pr, pn = _extract_aging_page(page.extract_text() or "",
+                                             fname, i, ctx)
+                aging_rows.extend(pr)
+                notes.extend(pn)
+            if not aging_rows:
+                notes.append(f"{fname}: aging report, no invoice rows parsed")
+            return rows, notes, meta, aging_rows
+        # ---- default: account-statement ledger ----
+        meta = _parse_statement_header(page1_text)
         for i, page in enumerate(pages, start=1):
             page_rows = 0
             for data in _extract_ledger_tables(page):
@@ -261,7 +447,7 @@ def extract_pdf(path):
                     notes.append(f"{fname} p{i}: no ledger table found")
     if not rows:
         notes.append(f"{fname}: no extractable ledger rows")
-    return rows, notes, meta
+    return rows, notes, meta, aging_rows
 
 
 def _dedupe(rows):
@@ -289,19 +475,23 @@ def normalize_rows(all_rows):
 
 
 def process_files(paths):
-    """Full pipeline: list of PDF paths -> (columns, rows, notes, statements).
+    """Full pipeline: list of PDF paths
+    -> (columns, rows, notes, statements, aging_columns, aging_rows).
 
     statements: one dict per file for the "Statements" sheet.
     """
     all_rows, notes, statements = [], [], []
+    aging_all = []
     for p in sorted(paths):
-        rows, n, meta = extract_pdf(p)
+        rows, n, meta, aging_rows = extract_pdf(p)
         all_rows.extend(rows)
+        aging_all.extend(aging_rows)
         notes.extend(n)
         statements.append({
             "Company": meta.get("company", ""),
             "CustomerCode": meta.get("customer_code", ""),
             "SourceFile": os.path.basename(p),
+            "Report": meta.get("report", "Account Statement"),
             "StmtStart": meta.get("stmt_start") or "",
             "StmtEnd": meta.get("stmt_end") or "",
             "SalesPerson": meta.get("sales_person", ""),
@@ -309,19 +499,23 @@ def process_files(paths):
             if meta.get("previous_balance") is not None else "",
             "NTN": meta.get("ntn", ""),
             "STRN": meta.get("strn", ""),
-            "Rows": len(rows),
+            "Rows": len(rows) + len(aging_rows),
         })
     cols, rows = normalize_rows(all_rows)
-    return cols, rows, notes, statements
+    aging_cols, aging_rows = normalize_aging(aging_all)
+    return cols, rows, notes, statements, aging_cols, aging_rows
 
 
 if __name__ == "__main__":
     import sys
-    cols, rows, notes, statements = process_files(sys.argv[1:])
-    print(f"rows={len(rows)} cols={len(cols)}")
+    cols, rows, notes, statements, aging_cols, aging_rows = process_files(
+        sys.argv[1:])
+    print(f"rows={len(rows)} cols={len(cols)} aging_rows={len(aging_rows)}")
     for s in statements:
         print("statement:", {k: v for k, v in s.items()})
     for n in notes:
         print("note:", n)
     for r in rows[:3]:
         print({k: v for k, v in r.items() if v != "" and not k.startswith("_")})
+    for r in aging_rows[:5]:
+        print({k: v for k, v in r.items() if v != ""})
